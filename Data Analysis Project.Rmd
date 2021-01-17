@@ -1,0 +1,241 @@
+---
+title: Data Analysis Project
+author: Lukas
+abstract: |
+  In this report, I replicate the results of a paper analysing the effect of receiving a job training grant on the scrap rate in manufacturing firms, using a Bayesian hierarchical model instead of a frequentist approach. Choosing noninformative priors, I get similar results when looking at the posterior mean of this effect. However, treating the parameters of the model as random variables allows me to make probabilistic statements about the size of the benefit of the job training grant on worker productivity.
+
+date: "`r Sys.Date()`"
+numbersections: true
+header-includes:
+   - \usepackage{amsmath}
+   - \usepackage{bm}
+output: pdf_document
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(wooldridge)
+library(data.table)
+library(plm)
+library(ggplot2)
+library(gridExtra)
+library(rjags)
+library(xtable)
+library(stargazer)
+options(scipen=999)
+data("jtrain")
+setDT(jtrain)
+set.seed(123)
+```
+
+
+Introduction
+============
+
+In this report, I analyse the effect of receiving a job training grant for manufacturing firms in Michigan during 1988 and 1989 on worker productivity. The analysis is based on a paper written by @Holzer, who originally collected the data for and analysed this panel, and on examples used in the textbook ``Introductory Econometrics: A Modern Approach'' by @Wooldridge, who extended the analysis with more sophisticated methods.
+
+Different from the frequentist approaches taken by them, I am using a Bayesian model to determine whether I get the same conclusion that receiving such a job training grant reduces the scrap rate as a measure of worker productivity. In particular, I'm setting up a Bayesian hierarchical model, allowing for firm specific effects and a time trend independent of the grant, which I then compare to the frequentist fixed effects model of @Wooldridge [p. 497]
+
+
+Data
+====
+
+The data for this analysis come from a survey conducted by @Holzer, which they mailed to the 498 firms that had applied for a job training grant during 1988 and 1989. In total, they received answers from 157 firms, among which 66 had received a grant. The data can be found in the `wooldridge` package using `data("jtrain")`. In my analysis, I will use the six variables shown in Table 1 below.
+
+\scriptsize
+
+```{r, echo=FALSE, warning=FALSE, results='asis', fig.height=4.5, fig.width=8, eval=TRUE}
+to_print <- jtrain[fcode %in% c(410523, 418011)
+                   ][1:6, .(year, fcode=as.character(fcode), scrap,
+                            grant, sales=format(sales, format="d", big.mark=","), employ)]
+names(to_print) <- paste("\\multicolumn{1}{c}{", names(to_print), "}", sep="")
+print(xtable(to_print, align=c("cccccrc"), caption="Data"),
+      sanitize.colnames.function=function(x){x}, comment=FALSE,
+      include.rownames=FALSE, size="\\fontsize{9pt}{10pt}\\selectfont")
+
+jtrain <- jtrain[!is.na(scrap) & !is.na(sales) & !is.na(employ),
+                 .(lscrap, scrap, fcode, year, d88, d89, grant, grant_1, lsales, sales, lemploy, employ)]
+```
+
+\normalsize
+
+This table illustrates the structure of the data set based on two firms. The variable *year* can take on values 1987 to 1989, *fcode* is a unique firm code number, *scrap* is number of defective items out of every 100 produced, *grant* takes on value 1 if the firm received a job training grant in that year, *sales* shows the annual sales in USD, and *employ* is the number of employees of the firm in that year. As shown, not all firms who applied for a grant did receive one, while the remaining ones received it in only one of the two years.
+
+After removing missing values for *scrap*, *sales*, and *employ*, there remain 148 observations for 51 firms (for 3 firms, no data is available in year 1987, and for 1 firm, no data is available in years 1987 and 1988). The firms with missing values are smaller, with the mean and median of *sales* and *employ* being roughly 25%-50% lower. However, as long as not reporting values for *scrap*, *sales*, and *employ* is not systematically related to whether a firm received a grant or not, removing these observations does not bias the estimate for the effect of the grant. Given that grants were given on a first-come, first-served basis, this is unlikely to be the case.
+
+Finally, I make the following adjustments to the data. First, because *scrap*, *sales*, and *employ* are very right skewed, I will work with the log of these variables, denoted by *lscrap*, *lsales*, and *lemploy*. And second, I create a lagged *grant* variable to allow for persistent effects of receiving a grant on worker productivity.
+
+Figure 1 below shows how the size of the firm is related to the scrap rate, and how the scrap rate varies over time as well as between firms that did or did not receive a grant. This reveals a positive relation between the number of employees and the scrap rate (in firms with more employees it seems that more items have to be discarded) and the productivity seems to improve over time. However, no immediate effect of the job training grant is visible here, before making use of the panel strucutre that allows us to control for firm specific unobservable characteristics. 
+
+
+```{r, echo=FALSE, warning=FALSE, results='asis', fig.height=4.5, fig.width=8, eval=TRUE, fig.cap="Summary Statistics"}
+p1 <- ggplot(jtrain, aes(factor(grant), lscrap)) +
+  geom_boxplot() + labs(x="grant", y="log(scrap)") +
+  theme_bw() + theme(panel.border=element_blank(), axis.line=element_line(colour="black"))
+p2 <- ggplot(jtrain, aes(factor(year), lscrap)) +
+  geom_boxplot() + labs(x="year", y="log(scrap)") +
+  theme_bw() + theme(panel.border=element_blank(), axis.line=element_line(colour="black"))
+p3 <- ggplot(jtrain, aes(lsales, lscrap)) +
+  geom_point() + geom_smooth(method="lm", se=FALSE, formula="y~x", colour="darkgrey") +
+  labs(x="log(sales)", y="log(scrap)") + theme_bw() + theme(panel.border=element_blank(), axis.line=element_line(colour="black"))
+p4 <- ggplot(jtrain, aes(lemploy, lscrap)) +
+  geom_point() + geom_smooth(method="lm", se=FALSE, formula="y~x", colour="darkgrey") +
+  labs(x="log(employ)", y="log(scrap)") + theme_bw() + theme(panel.border=element_blank(), axis.line=element_line(colour="black"))
+grid.arrange(p1, p2, p3, p4, nrow=2)
+```
+
+Model
+=====
+
+To analyse the effect of receiving a grant on worker productivity, I estimate the following model:
+
+\begin{equation}
+E[lscrap_{i,t}] = fcode_i + year_t + \beta_1 grant_{i,t} + \beta_2 grant_{i,t-1} + \gamma lsales_{i,t-1} + \delta lemploy_{i,t-1}
+\end{equation}
+
+where $i=1,\dots,51$ is the firm index and $t=1,2,3$ the year index. Including $fcode_i$ and $year_t$ allows for different intercepts for each firm and year, that is, for firm-specific effects which are constant over time and for changes over time in the scrap rate independent of the grant. $fcode_i + year_t$ is the intercept for firm $i$ in year $t$.
+
+I assume a normal likelihood for *lscrap_{i,t}*, where each firm $i$ has it's own mean and a common standard deviation, and for the firm and year indicators.
+
+\begin{align}
+lscrap_{i,t} | \bm{x_{i,t}}, \beta_1, \beta_2, \gamma, \delta &\overset{ind}{\sim} N(\mu_{i,t}, \sigma^2) \\
+fcode_i &\overset{iid}\sim N(a, b^2) \\
+year_t &\overset{iid}\sim N(c, d^2)
+\end{align}
+
+where $\bm{x_{i,t}} = fcode_i, year_t, grant_{i,t}, grant_{i,t-1}, lsales_{i,t-1}, lemploy_{i,t-1}$.
+
+To complete the hierarchical model, I assume the following priors for $fcode_i, year_t, a, b, c, d, \beta_1, \beta_2, \gamma, \delta\text{ and } \sigma$:
+
+\begin{align}
+a \sim N(0,100),\ b \sim IG(0.5,0.5),\ &c \sim N(0,100),\ d \sim IG(0.5,0.5), \\
+\beta_1 \sim N(0,100),\ \beta_2 \sim N(0,100),\ \gamma \sim N(0,&100),\ \delta \sim N(0,100),\ \sigma \sim IG(0.5,0.5)
+\end{align}
+
+Here, I assume a prior sample size of 1 and a prior guess for the variance of 1 when parametrising the inverse gamma priors for the variance of *lscrap*, *fcode*, and *year*. This will let the data dominate the posterior. The priors for *a* and *c* imply the assumption that on average the *year* and *fcode* have no effect on the scrap rate. Finally, I also center the remaining priors around 0, i.e. being ``skeptical'' about the effect of receiving a grant and assuming that firm size should not have a particular effect on the scrap rate.
+
+
+Results
+=======
+
+The frequentist estimation of (1) by ordinary least squares produces the following results, where the standard errors of the coefficients are reported in parentheses:
+
+\scriptsize
+
+```{r, echo=FALSE, warning=FALSE, results='asis', fig.height=4.5, fig.width=8, eval=TRUE}
+scrap_panel <- plm(lscrap ~ grant + grant_1 + lsales + lemploy, data = jtrain,
+                   index = c('fcode','year'), model = 'within', effect ='twoways')
+# summary(scrap_panel)
+#          Estimate Std. Error t-value Pr(>|t|)  
+# grant   -0.296754   0.157086 -1.8891  0.06206 .
+# grant_1 -0.535578   0.224206 -2.3888  0.01897 *
+# lsales  -0.086858   0.259698 -0.3345  0.73881  
+# lemploy -0.076368   0.350290 -0.2180  0.82791 
+linear_model <- lm(lscrap ~ -1 + grant + grant_1 + lsales + lemploy + factor(fcode) + factor(year), data=jtrain)
+# summary(linear_model)
+#                      Estimate Std. Error t value Pr(>|t|)  
+# grant               -0.296754   0.157086  -1.889   0.0621 .
+# grant_1             -0.535578   0.224206  -2.389   0.0190 *
+# lsales              -0.086858   0.259698  -0.334   0.7388  
+# lemploy             -0.076368   0.350290  -0.218   0.8279   
+# factor(year)1988    -0.003961   0.119549  -0.033   0.9736  
+# factor(year)1989    -0.132193   0.153686  -0.860   0.3920  
+output <- capture.output(stargazer(scrap_panel, title = "Frequentist Analysis"))
+output <- output[c(4:length(output))]
+output <- c(output[1:22],
+            "firm fixed effects & Yes \\\\","& \\\\","year fixed effects & Yes \\\\","& \\\\",
+            output[23:32])
+output[c(13,16,19,22,24,26)] <- paste(output[c(13,16,19,22,24,26)], "[-1.8ex]")
+cat(paste(output[c(1:30,32:36)], collapse = "\n"), "\n")
+```
+
+\normalsize
+\newpage
+
+This suggests that obtaining a grant in year 1988 lowers the scrap rate by about $1-e^{-0.297} = 25.7\%$ and, interestingly, the lagged effect of receiving a grant in year $t-1$ on the scrap rate in year $t$ is even larger ($1-e^{-0.536}=41.5\%$). Not shown here is that the year fixed effects both are negative. So, the scrap rate on average declined for all firms, including the ones which did not receive a grant, highlighting the importance to include the year fixed effects.
+
+Next, I fit the Bayesian hierarchical model, using 1,000 burn-in iterations followed by 20,000 iterations that I monitor. While convergence looks okay for the two main parameters of interest, $\beta_1$ and $\beta_2$, in particular $a$ and $c$ (the means for the firm and year intercepts) show strong autocorrelation. Nonetheless, inference for the effect of receiving a grant will be accurate.
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, results='asis', fig.height=2, fig.width=8, eval=TRUE, fig.cap="Posterior Densities"}
+mod_string <- "model{
+  for (i in 1:length(lscrap)){
+    lscrap[i] ~ dnorm(mu[i], prec)
+    mu[i] <- f[fcode_[i]] + y[year_[i]] + beta1 * grant[i] + beta2 * grant_1[i] + gamma * lsales[i] + delta * lemploy[i]
+  }
+  
+  for (j in 1:51){
+    f[j] ~ dnorm(a, prec_b)
+  }
+  for (j in 1:3){
+    y[j] ~ dnorm(c, prec_d)
+  }
+  a ~ dnorm(0, 1/100)
+  c ~ dnorm(0, 1/100)
+  prec_b ~ dgamma(1/2, 1*1/2)
+  b <- sqrt(1/prec_b)
+  prec_d ~ dgamma(1/2, 1*1/2)
+  d <- sqrt(1/prec_d)
+  
+  beta1 ~ dnorm(0, 1/100)
+  beta2 ~ dnorm(0, 1/100)
+  gamma ~ dnorm(0, 1/100)
+  delta ~ dnorm(0, 1/100)
+  prec ~ dgamma(1/2, 1*1/2)
+  sig <- sqrt(1/prec)
+}"
+data_jags <- as.list(jtrain[,.(lscrap, year, fcode_=.GRP, grant, grant_1, lsales, lemploy), by=fcode
+                            ][,.(lscrap, year_=.GRP, fcode_, grant, grant_1, lsales, lemploy), by=year
+                              ][,.(lscrap, year_, fcode_, grant, grant_1, lsales, lemploy)])
+params <- c("f[4]","f[27]","f[30]","f[35]","y", "beta1", "beta2", "gamma", "delta", "sig", "a", "b", "c", "d")
+mod <- jags.model(textConnection(mod_string), data=data_jags, n.chains=3, quiet=TRUE)
+update(mod, 1e3)
+mod_sim <- coda.samples(mod, variable.names=params, n.iter=2e4)
+mod_csim <- as.mcmc(do.call(rbind, mod_sim))
+# plot(mod_sim)
+# autocorr.diag(mod_sim)
+# autocorr.plot(mod_sim)
+# effectiveSize(mod_sim)
+# summary(mod_sim)
+#          Mean      SD  Naive SE Time-series SE
+# a     -0.3249 3.11769 0.0127279      1.0117918
+# b      1.3437 0.14811 0.0006047      0.0018233
+# beta1 -0.2602 0.15714 0.0006415      0.0016113
+# beta2 -0.4373 0.22163 0.0009048      0.0024248
+# c      3.9385 2.76331 0.0112812      0.7191185
+# d      0.8142 0.60700 0.0024781      0.0038896
+# delta  0.3928 0.27229 0.0011116      0.0332448
+# f[11] -0.7770 3.17874 0.0129772      1.0291700
+# f[1]  -3.5363 3.15730 0.0128896      0.9362926
+# f[21] -0.4950 3.15424 0.0128771      0.8282373
+# gamma -0.3041 0.22454 0.0009167      0.0725726
+# sig    0.5068 0.03779 0.0001543      0.0002542
+# y[1]   4.0141 2.70519 0.0110439      0.7827128
+# y[2]   3.9952 2.71156 0.0110699      0.7863266
+# y[3]   3.8440 2.71692 0.0110918      0.7521957
+toPlot <- as.data.table(mod_csim)
+p1 <- ggplot(toPlot) +
+  geom_density(aes(beta1)) + geom_vline(xintercept = mean(toPlot$beta1)) + 
+  labs(x=latex2exp::TeX("$\\beta_1$"), y="density") +
+  theme_bw() + theme(panel.border=element_blank(), axis.line=element_line(colour="black"))
+p2 <- ggplot(toPlot) +
+  geom_density(aes(beta2)) + geom_vline(xintercept = mean(toPlot$beta2)) + 
+  labs(x=latex2exp::TeX("$\\beta_2$"), y="density") +
+  theme_bw() + theme(panel.border=element_blank(), axis.line=element_line(colour="black"))
+grid.arrange(p1, p2, nrow=1)
+```
+
+Hence, with the chosen priors, the results are similar to the frequentist analysis. Receiving a grant seems to strongly reduce the scrap rate, with the effect in the year after being even stronger. Both parameters are slightly smaller, with posterior means of $-0.26$ for $\beta_1$ and $-0.44$ for $\beta_2$, most likely due to the prior which was centered at zero.
+
+Although the posterior means are similar to what we've seen in Table 2, it's now further possible to say that the probability that receiving a grant reduces the scrap rate $P(\beta_1<0)=0.95\%$.
+
+Conclusions
+===========
+
+To conclude, by choosing relatively noninformative priors, I arrived at similar results for the effect of receiving a job training grant on the scarp rate of a manufacturing firm. However, the Bayesian analysis bring the advantage of taking better into account the uncertainty related to the model and parameter values.
+
+References
+==========
+
+
